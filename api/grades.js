@@ -4,7 +4,12 @@ const fetch = require('node-fetch');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+// ✅ Allow only your GitHub Pages site
+app.use(cors({
+  origin: 'https://ilyambr.me'
+}));
+
 app.use(express.json());
 
 app.post('/api/grades', async (req, res) => {
