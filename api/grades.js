@@ -1,16 +1,14 @@
-// force redeploy to install cors
-
 const express = require('express');
 const fetch = require('node-fetch');
 const cors = require('cors');
+const serverless = require('serverless-http');
 
 const app = express();
 
-// ✅ Allow only your GitHub Pages site
+// ✅ Proper CORS config for GitHub Pages
 app.use(cors({
   origin: 'https://ilyambr.me'
 }));
-
 app.use(express.json());
 
 app.post('/api/grades', async (req, res) => {
@@ -46,4 +44,5 @@ app.post('/api/grades', async (req, res) => {
   }
 });
 
-module.exports = app;
+// ✅ Export wrapped Express app for Vercel
+module.exports = serverless(app);
