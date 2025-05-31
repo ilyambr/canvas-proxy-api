@@ -12,7 +12,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('/', cors(corsOptions)); // Fixes preflight!
+app.options('/', cors(corsOptions)); // IMPORTANT: this must match the route Vercel calls
 
 app.use(express.json());
 
