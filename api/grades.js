@@ -1,13 +1,12 @@
 // File: api/grades.js
 
 const express = require('express');
-const fetch = require('node-fetch'); // If using Node18+, you can drop this line.
+const fetch = require('node-fetch'); // If your environment is Node 18+, you can drop this import
 const cors = require('cors');
 const serverless = require('serverless-http');
 
 const app = express();
 
-// Only allow your front-end origin to call us:
 app.use(
   cors({
     origin: 'https://ilyambr.me',
@@ -15,20 +14,19 @@ app.use(
     allowedHeaders: ['Content-Type'],
   })
 );
-app.options('/api/grades', cors()); // enable preflight
-
+app.options('/api/grades', cors()); // handle preflight
 app.use(express.json());
 
-/**
- * Helper: fetch JSON and throw if not ok.
- */
+/** Helper: fetch JSON or throw */
 async function fetchJsonOrThrow(url, options = {}) {
-  const resp = await fetch(url, options);
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    throw new Error(`Fetch to ${url} failed: ${resp.status} ${resp.statusText} – ${text}`);
+  const r = await fetch(url, options);
+  if (!r.ok) {
+    // Try to read the error body for debugging
+    let bodyText;
+    try { bodyText = await r.text(); } catch { bodyText = '<no body>'; }
+    throw new Error(`Request to ${url} failed: ${r.status} ${r.statusText} → ${bodyText}`);
   }
-  return resp.json();
+  return r.json();
 }
 
 app.post('/api/grades', async (req, res) => {
@@ -38,35 +36,30 @@ app.post('/api/grades', async (req, res) => {
   }
 
   try {
-    // 1) First, fetch the full list of courses
+    //
+    // 1) Fetch all courses
+    //
     const courses = await fetchJsonOrThrow(
       'https://providencepsd.instructure.com/api/v1/courses',
       {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+        headers: { Authorization: `Bearer ${token}` },
       }
     );
-    // courses = [ { id: 34917, name: "...", enrollments: [ {user_id: 13888, ...}, ... ] }, ... ]
+    // courses is an array of objects like { id: 34917, name: "ITALIAN II-CAPRIO", enrollments: [...] }
 
     if (!Array.isArray(courses) || courses.length === 0) {
-      return res.json([]); // no courses at all
+      // No courses at all
+      return res.json([]);
     }
 
-    // 2) Extract the student’s user_id from the first enrollment in the first course:
-    //    (every course has an "enrollments" array; pick the first enrollment of type StudentEnrollment)
+    //
+    // 2) Extract your user_id from the first StudentEnrollment we find
+    //
     let studentId = null;
-    for (const enr of courses[0].enrollments || []) {
-      if (enr.type === 'StudentEnrollment') {
-        studentId = enr.user_id;
-        break;
-      }
-    }
-    if (!studentId) {
-      // If we didn’t find student_id in the first course, try scanning them all:
-      outerLoop: 
-      for (const course of courses) {
-        for (const enr of course.enrollments || []) {
+    outerLoop:
+    for (const course of courses) {
+      if (Array.isArray(course.enrollments)) {
+        for (const enr of course.enrollments) {
           if (enr.type === 'StudentEnrollment') {
             studentId = enr.user_id;
             break outerLoop;
@@ -75,110 +68,66 @@ app.post('/api/grades', async (req, res) => {
       }
     }
     if (!studentId) {
-      throw new Error('Unable to determine your Canvas user_id from any enrollment.');
+      throw new Error('Could not find your Canvas user_id in any enrollment');
     }
 
+    //
+    // 3) For each course, fetch that course’s gradebook_history (just page=1, up to 100 entries)
+    //
     const results = [];
 
-    // 3) For each course, fetch assignments + gradebook_history
     for (const course of courses) {
       const courseId = course.id;
       const courseName = course.name;
 
-      // A) Fetch this course’s assignments:
-      let assignmentList = [];
-      try {
-        const rawAssigns = await fetchJsonOrThrow(
-          `https://providencepsd.instructure.com/api/v1/courses/${courseId}/assignments`,
-          {
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          }
-        );
-        // rawAssigns is an Array; map to minimal fields:
-        assignmentList = rawAssigns.map((a) => ({
-          id: a.id,
-          name: a.name,
-          points_possible: a.points_possible,
-        }));
-      } catch (err) {
-        console.warn(`Could not fetch assignments for course ${courseId}: ${err.message}`);
-        assignmentList = [];
-      }
-
-      // B) Fetch this course’s gradebook history (paginated). We want to find the most recent
-      //    grade history entry whose column_title is "Final Score" for our student.
+      let historyPage = [];
       let finalGrade = null;
 
       try {
-        let page = 1;
-        let morePages = true;
-        let allHistoryEntries = [];
-
-        while (morePages) {
-          const historyPage = await fetchJsonOrThrow(
-            `https://providencepsd.instructure.com/api/v1/courses/${courseId}/gradebook_history?student[]=`
-              + encodeURIComponent(studentId)
-              + `&per_page=100&page=${page}`,
-            {
-              headers: { Authorization: `Bearer ${token}` },
-            }
-          );
-          // historyPage is an array of history objects. If it’s empty, we stop:
-          if (!Array.isArray(historyPage) || historyPage.length === 0) {
-            morePages = false;
-          } else {
-            allHistoryEntries = allHistoryEntries.concat(historyPage);
-            page += 1;
-            // If Canvas returns fewer than 100 entries, we’re on the last page:
-            if (historyPage.length < 100) {
-              morePages = false;
-            }
+        // We only pull the first page (per_page=100). If you expect >100 history entries,
+        // you can loop `&page=1`, `&page=2`… just like before. Here we assume ≤100.
+        historyPage = await fetchJsonOrThrow(
+          `https://providencepsd.instructure.com/api/v1/courses/${courseId}/gradebook_history`
+          + `?student[]=${encodeURIComponent(studentId)}`
+          + `&per_page=100&page=1`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
           }
-        }
+        );
+        // Now historyPage is an array like:
+        // [ { id: 7272727, user_id: 13888, column_title: "Participation", new_grade: "32", recorded_at: "…" },
+        //   { id: 7272728, user_id: 13888, column_title: "Final Score", new_grade: "90.94", recorded_at: "2025-05-24T02:00:00Z" },
+        //   … up to 100 items … ]
+        //
+        // We look for the latest entry where column_title === "Final Score".
+        // (Canvas always writes a “Final Score” row when it finalizes your course grade.)
 
-        // Each history entry looks like:
-        // {
-        //   id: 7272727,
-        //   user_id: 13888,
-        //   column_title: "Final Score",
-        //   new_grade: "90.94",         <— the new final grade as a string
-        //   old_grade: "0",
-        //   recorded_at: "2025-05-24T02:00:00Z",
-        //   ...
-        // }
-        // Find all entries where column_title === "Final Score", then pick the one with the latest timestamp:
-        const finalScoreEntries = allHistoryEntries.filter(
+        // Filter only the "Final Score" entries
+        const finalScoreEntries = (historyPage || []).filter(
           (h) => h.column_title === 'Final Score'
         );
 
         if (finalScoreEntries.length > 0) {
-          // Sort by recorded_at descending, take the first:
-          finalScoreEntries.sort((a, b) => {
-            return new Date(b.recorded_at) - new Date(a.recorded_at);
-          });
-          finalGrade = finalScoreEntries[0].new_grade;
-        } else {
-          // If no "Final Score" event, maybe fall back to "Current Score" or something else:
-          // For now, leave finalGrade = null
-          finalGrade = null;
+          // Sort by recorded_at descending
+          finalScoreEntries.sort((a, b) =>
+            new Date(b.recorded_at) - new Date(a.recorded_at)
+          );
+          finalGrade = finalScoreEntries[0].new_grade; // e.g. "90.94" or "B+" etc.
         }
       } catch (err) {
-        console.warn(`Could not fetch gradebook history for course ${courseId}: ${err.message}`);
+        console.warn(`Could not fetch gradebook_history for course ${courseId}:`, err.message);
+        historyPage = [];  // leave it empty
         finalGrade = null;
       }
 
-      // 4) Push for this course:
       results.push({
         course_id: courseId,
         course_name: courseName,
-        final_grade: finalGrade,     // will be a string like "90.94" or null
-        assignments: assignmentList,  // array of { id, name, points_possible }
+        final_grade: finalGrade,      // string or null
+        history: historyPage,         // array of up to 100 history objects
       });
     }
 
-    // 5) Return the final array
     return res.json(results);
   } catch (err) {
     console.error('Proxy error:', err);
