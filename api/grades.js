@@ -12,11 +12,11 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('/', cors(corsOptions)); // IMPORTANT: this must match the route Vercel calls
+app.options('/api/grades', cors(corsOptions)); // IMPORTANT: this must match the route Vercel calls
 
 app.use(express.json());
 
-app.post('/', async (req, res) => {
+app.post('/api/grades', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Missing token' });
 
