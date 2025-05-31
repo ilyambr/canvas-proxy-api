@@ -1,50 +1,59 @@
-// api/grades.js
+// File: api/grades.js
 
-export default async function handler(req, res) {
-  // ─── CORS: Always include these headers ────────────────────────────────
+// We export a single CommonJS function. Vercel will call this for any
+// request to https://<your-VERCEL-DOMAIN>/api/grades
+module.exports = async function (req, res) {
+  // ─── Step A: Always set CORS headers first ────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin', 'https://ilyambr.me');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // ─── Handle preflight OPTIONS ─────────────────────────────────────────
+  // ─── Step B: If this is the CORS preflight (OPTIONS), immediately return 200 ─
   if (req.method === 'OPTIONS') {
-    // Returning 200 with the CORS headers above satisfies the preflight
+    // The browser’s preflight sees 200 + the CORS headers above → done.
     return res.status(200).end();
   }
 
-  // ─── Only allow POST for the actual grades request ────────────────────
+  // ─── Step C: Only allow POST from here on ──────────────────────────────────
   if (req.method !== 'POST') {
+    // Inform the client that only POST/OPTIONS are allowed.
     res.setHeader('Allow', 'POST, OPTIONS');
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // ─── Parse JSON body ───────────────────────────────────────────────────
-  let body;
+  // ─── Step D: Read + parse the JSON body manually ────────────────────────────
+  let bodyData = '';
   try {
-    body = await new Promise((resolve, reject) => {
-      let data = '';
-      req.on('data', chunk => (data += chunk));
+    await new Promise((resolve, reject) => {
+      req.on('data', (chunk) => (bodyData += chunk));
       req.on('end', () => {
         try {
-          resolve(JSON.parse(data));
+          resolve();
         } catch (e) {
           reject(e);
         }
       });
-      req.on('error', reject);
+      req.on('error', (err) => reject(err));
     });
+  } catch (err) {
+    return res.status(400).json({ error: 'Error reading request body' });
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyData || '{}');
   } catch (err) {
     return res.status(400).json({ error: 'Invalid JSON body' });
   }
 
-  const token = body.token;
+  const token = parsed.token;
   if (!token || typeof token !== 'string') {
     return res.status(400).json({ error: 'Missing token' });
   }
 
-  // ─── Fetch Canvas Courses & Grades ────────────────────────────────────
+  // ─── Step E: Proxy to Canvas and build “grades” array ────────────────────────
   try {
-    // 1) Get list of courses
+    // 1) Fetch course list from Canvas
     const courseRes = await fetch(
       'https://providencepsd.instructure.com/api/v1/courses',
       {
@@ -56,8 +65,8 @@ export default async function handler(req, res) {
     }
     const courses = await courseRes.json();
 
-    // 2) For each course, fetch enrollment & grades
-    const results = [];
+    // 2) For each course, fetch enrollments (to find the StudentEnrollment + grades)
+    const grades = [];
     for (const course of courses) {
       const enrollRes = await fetch(
         `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments`,
@@ -66,13 +75,13 @@ export default async function handler(req, res) {
         }
       );
       if (!enrollRes.ok) {
-        // skip if Canvas won’t return enrollment for this course
+        // If Canvas says 401/403/404 for this course’s enrollments, skip it
         continue;
       }
       const enrollments = await enrollRes.json();
-      const student = enrollments.find(e => e.type === 'StudentEnrollment');
+      const student = enrollments.find((e) => e.type === 'StudentEnrollment');
       if (student && student.grades) {
-        results.push({
+        grades.push({
           course: course.name,
           grade: student.grades.current_grade || 'N/A',
           score: student.grades.current_score || 'N/A'
@@ -80,9 +89,10 @@ export default async function handler(req, res) {
       }
     }
 
-    // 3) Return the JSON array of { course, grade, score }
-    return res.status(200).json(results);
+    // 3) Return the JSON array of grades
+    return res.status(200).json(grades);
   } catch (err) {
+    // On any error (Canvas token invalid, network error, etc.), return 500 + message
     return res.status(500).json({ error: err.message });
   }
-}
+};
