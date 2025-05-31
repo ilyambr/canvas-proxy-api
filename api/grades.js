@@ -1,61 +1,30 @@
-// File: api/grades.js
+const express = require('express');
+const fetch = require('node-fetch');    // or global fetch if using Node 18+
+const cors = require('cors');
+const serverless = require('serverless-http');
 
-// ─── IMPORTANT: Use an ES Module "export default" function ─────────────────────
-// Vercel’s Node-18 Serverless Runtime expects this format. If you use
-// module.exports, the platform may not run your code exactly as you wrote it.
+const app = express();
 
-export default async function handler(req, res) {
-  // ─── Step A: Manually add CORS headers for both OPTIONS and POST ─────────
-  res.setHeader('Access-Control-Allow-Origin', 'https://ilyambr.me');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+// 1️⃣ Allow your website (https://ilyambr.me) to call this endpoint:
+app.use(
+  cors({
+    origin: 'https://ilyambr.me',
+    methods: ['POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type'],
+  })
+);
+app.options('/api/grades', cors()); // Preflight support
 
-  // ─── Step B: If this is a CORS preflight (OPTIONS), return 200 immediately ──
-  if (req.method === 'OPTIONS') {
-    // No body needed—just the headers above satisfy the browser’s preflight
-    return res.status(200).end();
-  }
+app.use(express.json());
 
-  // ─── Step C: Only accept POST for the actual grades request ────────────────
-  if (req.method !== 'POST') {
-    // Tell the client that only POST and OPTIONS are allowed
-    res.setHeader('Allow', 'POST, OPTIONS');
-    return res.status(405).json({ error: 'Method Not Allowed' });
-  }
-
-  // ─── Step D: Read + parse the JSON body ────────────────────────────────────
-  let rawBody = '';
-  try {
-    await new Promise((resolve, reject) => {
-      req.on('data', (chunk) => {
-        rawBody += chunk;
-      });
-      req.on('end', () => {
-        resolve();
-      });
-      req.on('error', (err) => {
-        reject(err);
-      });
-    });
-  } catch (err) {
-    return res.status(400).json({ error: 'Error reading request body' });
-  }
-
-  let body;
-  try {
-    body = JSON.parse(rawBody || '{}');
-  } catch (err) {
-    return res.status(400).json({ error: 'Invalid JSON body' });
-  }
-
-  const token = body.token;
-  if (!token || typeof token !== 'string') {
+app.post('/api/grades', async (req, res) => {
+  const { token } = req.body;
+  if (!token) {
     return res.status(400).json({ error: 'Missing token' });
   }
 
-  // ─── Step E: Proxy logic to Canvas, collect courses + grades ────────────────
   try {
-    // 1) Fetch the list of courses for this student
+    // 2️⃣ Fetch your list of courses from Canvas:
     const courseRes = await fetch(
       'https://providencepsd.instructure.com/api/v1/courses',
       {
@@ -63,38 +32,77 @@ export default async function handler(req, res) {
       }
     );
     if (!courseRes.ok) {
-      throw new Error(`Canvas returned ${courseRes.status} when fetching courses`);
+      throw new Error(`Courses fetch failed (status ${courseRes.status})`);
     }
-    const courses = await courseRes.json();
+    const courses = await courseRes.json(); // array of { id, name, … }
 
-    // 2) Loop through each course, fetch enrollments, and extract grades
-    const grades = [];
+    // 3️⃣ For each course, fetch enrollment (with current_grade) AND assignments (with submission)
+    const results = [];
+
     for (const course of courses) {
+      // --- Fetch the StudentEnrollment including grades.
       const enrollRes = await fetch(
-        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments`,
+        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments?` +
+          `type[]=StudentEnrollment&include[]=grades`,
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
       if (!enrollRes.ok) {
-        // If Canvas returns an error for this course’s enrollments, skip it
+        console.warn(
+          `Enrollment fetch failed for course ${course.id} (status ${enrollRes.status})`
+        );
+        // If we can’t fetch enrollment, skip this course
         continue;
       }
-      const enrollments = await enrollRes.json();
-      const studentEntry = enrollments.find((e) => e.type === 'StudentEnrollment');
-      if (studentEntry && studentEntry.grades) {
-        grades.push({
-          course: course.name,
-          grade: studentEntry.grades.current_grade || 'N/A',
-          score: studentEntry.grades.current_score || 'N/A',
+      const enrollArr = await enrollRes.json();
+      const me = enrollArr.find((e) => e.type === 'StudentEnrollment');
+
+      // Prepare the “course‐level” data:
+      const currentGrade = me?.grades?.current_grade ?? null;   // e.g. “A-”
+      const currentScore = me?.grades?.current_score ?? null;   // e.g. 90.94
+
+      // --- Fetch assignments + your submission for this course:
+      const assignmentsRes = await fetch(
+        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/assignments?` +
+          `include[]=submission&student_ids[]=self`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      let assignmentsList = [];
+      if (assignmentsRes.ok) {
+        const assignmentsJson = await assignmentsRes.json(); // array of assignment objects
+        // Build a lighter array:
+        assignmentsList = assignmentsJson.map((a) => {
+          return {
+            name: a.name,
+            score: a.submission?.score ?? null,
+            possible: a.points_possible ?? null,
+            status: a.submission?.workflow_state ?? 'not_submitted',
+          };
         });
+      } else {
+        console.warn(
+          `Assignments fetch failed for course ${course.id} (status ${assignmentsRes.status})`
+        );
       }
+
+      // 4️⃣ Push the combined object into “results”
+      results.push({
+        course: course.name,
+        current_grade: currentGrade,
+        current_score: currentScore,
+        assignments: assignmentsList,
+      });
     }
 
-    // 3) Return the array of { course, grade, score } objects
-    return res.status(200).json(grades);
+    // 5️⃣ Return that combined array
+    return res.json(results);
   } catch (err) {
-    // If anything breaks (invalid token, network error, etc.), send back a 500
+    console.error('Proxy Error:', err);
     return res.status(500).json({ error: err.message });
   }
-}
+});
+
+module.exports = serverless(app);
