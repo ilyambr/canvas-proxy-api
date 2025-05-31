@@ -12,11 +12,11 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('/api/grades', cors(corsOptions)); //  CORS preflight
+app.options('/', cors(corsOptions)); // Fixes preflight!
 
 app.use(express.json());
 
-app.post('/api/grades', async (req, res) => {
+app.post('/', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Missing token' });
 
