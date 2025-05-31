@@ -1,14 +1,15 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const cors = require('cors');
-const serverless = require('serverless-http');
+const serverless = require('serverless-http'); // this is critical!
 
 const app = express();
 
-// ✅ Proper CORS config for GitHub Pages
+// CORS header specifically for your GitHub Pages
 app.use(cors({
   origin: 'https://ilyambr.me'
 }));
+
 app.use(express.json());
 
 app.post('/api/grades', async (req, res) => {
@@ -44,5 +45,5 @@ app.post('/api/grades', async (req, res) => {
   }
 });
 
-// ✅ Export wrapped Express app for Vercel
+// ✅ must wrap app in serverless-http for Vercel to respect CORS
 module.exports = serverless(app);
