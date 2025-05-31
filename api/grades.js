@@ -1,40 +1,50 @@
 // api/grades.js
 
-const express = require('express');
-const fetch = require('node-fetch');
-const serverless = require('serverless-http');
-
-const app = express();
-
-// ─── Manually inject CORS headers for EVERY request ───────────────────────────
-app.use((req, res, next) => {
-  // Allow only your GitHub Pages origin
+export default async function handler(req, res) {
+  // ─── CORS: Always include these headers ────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin', 'https://ilyambr.me');
-  // Allow POST and OPTIONS (preflight)
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  // Allow JSON content-type
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  // If this is a preflight request, just return 200 immediately:
+
+  // ─── Handle preflight OPTIONS ─────────────────────────────────────────
   if (req.method === 'OPTIONS') {
+    // Returning 200 with the CORS headers above satisfies the preflight
     return res.status(200).end();
   }
-  next();
-});
 
-// ─── Built‐in JSON parser ───────────────────────────────────────────────────────
-app.use(express.json());
+  // ─── Only allow POST for the actual grades request ────────────────────
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST, OPTIONS');
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
 
-// ─── Main POST route at “/” ────────────────────────────────────────────────────
-// Because Vercel auto‐routes “api/grades.js” → “https://<your-app>.vercel.app/api/grades”
-// inside this file, we only register “app.post('/')”.
-app.post('/', async (req, res) => {
-  const { token } = req.body;
-  if (!token) {
+  // ─── Parse JSON body ───────────────────────────────────────────────────
+  let body;
+  try {
+    body = await new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', chunk => (data += chunk));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(e);
+        }
+      });
+      req.on('error', reject);
+    });
+  } catch (err) {
+    return res.status(400).json({ error: 'Invalid JSON body' });
+  }
+
+  const token = body.token;
+  if (!token || typeof token !== 'string') {
     return res.status(400).json({ error: 'Missing token' });
   }
 
+  // ─── Fetch Canvas Courses & Grades ────────────────────────────────────
   try {
-    // 1) Fetch the list of courses for this student
+    // 1) Get list of courses
     const courseRes = await fetch(
       'https://providencepsd.instructure.com/api/v1/courses',
       {
@@ -42,13 +52,12 @@ app.post('/', async (req, res) => {
       }
     );
     if (!courseRes.ok) {
-      // If token is invalid or expired, Canvas returns 401/403 or similar:
       throw new Error(`Canvas returned ${courseRes.status} when fetching courses`);
     }
     const courses = await courseRes.json();
 
-    // 2) For each course, fetch the enrollment/grades
-    const grades = [];
+    // 2) For each course, fetch enrollment & grades
+    const results = [];
     for (const course of courses) {
       const enrollRes = await fetch(
         `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments`,
@@ -57,13 +66,13 @@ app.post('/', async (req, res) => {
         }
       );
       if (!enrollRes.ok) {
-        // If Canvas returns an error for this course, skip it.
+        // skip if Canvas won’t return enrollment for this course
         continue;
       }
       const enrollments = await enrollRes.json();
-      const student = enrollments.find((e) => e.type === 'StudentEnrollment');
+      const student = enrollments.find(e => e.type === 'StudentEnrollment');
       if (student && student.grades) {
-        grades.push({
+        results.push({
           course: course.name,
           grade: student.grades.current_grade || 'N/A',
           score: student.grades.current_score || 'N/A'
@@ -71,13 +80,9 @@ app.post('/', async (req, res) => {
       }
     }
 
-    // 3) Return the array of { course, grade, score } back to the client
-    return res.json(grades);
+    // 3) Return the JSON array of { course, grade, score }
+    return res.status(200).json(results);
   } catch (err) {
-    // If anything goes wrong (invalid token, network error, etc.), return 500 + message
     return res.status(500).json({ error: err.message });
   }
-});
-
-// ─── Wrap the Express app in “serverless-http” so Vercel can run it properly ────
-module.exports = serverless(app);
+}
