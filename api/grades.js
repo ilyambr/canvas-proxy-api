@@ -1,11 +1,12 @@
+// File: api/grades.js
 const express = require('express');
-const fetch = require('node-fetch');    // or global fetch if using Node 18+
+const fetch = require('node-fetch'); // or global fetch if Node v18+
 const cors = require('cors');
 const serverless = require('serverless-http');
 
 const app = express();
 
-// 1️⃣ Allow your website (https://ilyambr.me) to call this endpoint:
+// ONLY allow your domain to call this proxy:
 app.use(
   cors({
     origin: 'https://ilyambr.me',
@@ -13,7 +14,7 @@ app.use(
     allowedHeaders: ['Content-Type'],
   })
 );
-app.options('/api/grades', cors()); // Preflight support
+app.options('/api/grades', cors()); // handle preflight
 
 app.use(express.json());
 
@@ -24,26 +25,26 @@ app.post('/api/grades', async (req, res) => {
   }
 
   try {
-    // 2️⃣ Fetch your list of courses from Canvas:
-    const courseRes = await fetch(
+    // 1) Fetch all courses you’re enrolled in
+    const coursesRes = await fetch(
       'https://providencepsd.instructure.com/api/v1/courses',
       {
         headers: { Authorization: `Bearer ${token}` },
       }
     );
-    if (!courseRes.ok) {
-      throw new Error(`Courses fetch failed (status ${courseRes.status})`);
+    if (!coursesRes.ok) {
+      throw new Error(
+        `Failed to fetch courses (status ${coursesRes.status})`
+      );
     }
-    const courses = await courseRes.json(); // array of { id, name, … }
+    const courses = await coursesRes.json(); // array of { id, name, … }
 
-    // 3️⃣ For each course, fetch enrollment (with current_grade) AND assignments (with submission)
     const results = [];
 
     for (const course of courses) {
-      // --- Fetch the StudentEnrollment including grades.
+      // 2a) Fetch your StudentEnrollment (with grades) for this course
       const enrollRes = await fetch(
-        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments?` +
-          `type[]=StudentEnrollment&include[]=grades`,
+        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/enrollments?type[]=StudentEnrollment&include[]=grades`,
         {
           headers: { Authorization: `Bearer ${token}` },
         }
@@ -52,43 +53,100 @@ app.post('/api/grades', async (req, res) => {
         console.warn(
           `Enrollment fetch failed for course ${course.id} (status ${enrollRes.status})`
         );
-        // If we can’t fetch enrollment, skip this course
-        continue;
+        continue; // skip this course if enrollment fails
       }
       const enrollArr = await enrollRes.json();
       const me = enrollArr.find((e) => e.type === 'StudentEnrollment');
 
-      // Prepare the “course‐level” data:
-      const currentGrade = me?.grades?.current_grade ?? null;   // e.g. “A-”
-      const currentScore = me?.grades?.current_score ?? null;   // e.g. 90.94
+      // Grab overall course‐level grade & score (may be null)
+      const currentGrade = me?.grades?.current_grade ?? null;
+      const currentScore = me?.grades?.current_score ?? null;
 
-      // --- Fetch assignments + your submission for this course:
-      const assignmentsRes = await fetch(
-        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/assignments?` +
-          `include[]=submission&student_ids[]=self`,
+      // 2b) Fetch all of *your* submissions in this course
+      //     This returns one submission object per assignment you are enrolled in.
+      //     Each submission object has .assignment_id, .score, .grade, .workflow_state, etc.
+      const subRes = await fetch(
+        `https://providencepsd.instructure.com/api/v1/courses/${course.id}/students/submissions?student_ids[]=self`,
         {
           headers: { Authorization: `Bearer ${token}` },
         }
       );
-      let assignmentsList = [];
-      if (assignmentsRes.ok) {
-        const assignmentsJson = await assignmentsRes.json(); // array of assignment objects
-        // Build a lighter array:
-        assignmentsList = assignmentsJson.map((a) => {
-          return {
-            name: a.name,
-            score: a.submission?.score ?? null,
-            possible: a.points_possible ?? null,
-            status: a.submission?.workflow_state ?? 'not_submitted',
-          };
-        });
-      } else {
+      if (!subRes.ok) {
         console.warn(
-          `Assignments fetch failed for course ${course.id} (status ${assignmentsRes.status})`
+          `Submissions fetch failed for course ${course.id} (status ${subRes.status})`
         );
+        // We’ll treat “no submissions” as an empty list
+      }
+      const submissions = subRes.ok ? await subRes.json() : [];
+
+      // 3) We need the assignment *names*, but the /students/submissions route only returns assignment_id.
+      //    So gather all assignment IDs, then fetch them in one multi‐id call:
+      //    Canvas supports fetching multiple assignments by ID in a single request:
+      //      GET /api/v1/courses/:course_id/assignments?access_only[IDs]=12345,67890,…
+      //    However, Canvas’s “multi‐id” filter differs by account; if that doesn’t work, fallback is to fetch each assignment one by one.
+      //
+      //    We'll attempt the “?assignment_ids[]=...” style. If it fails, we do one by one.
+
+      const assignmentIDs = submissions
+        .map((s) => s.assignment_id)
+        .filter(Boolean);
+
+      let assignmentObjects = [];
+      if (assignmentIDs.length > 0) {
+        // Build a query string like ?assignment_ids[]=123&assignment_ids[]=456
+        const qs = assignmentIDs
+          .map((id) => `assignment_ids[]=${id}`)
+          .join('&');
+
+        const assignFetch = await fetch(
+          `https://providencepsd.instructure.com/api/v1/courses/${course.id}/assignments?${qs}`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+        if (assignFetch.ok) {
+          assignmentObjects = await assignFetch.json(); // array of assignments
+        } else {
+          // fallback: one-by-one
+          assignmentObjects = [];
+          for (const aID of assignmentIDs) {
+            const singleA = await fetch(
+              `https://providencepsd.instructure.com/api/v1/courses/${course.id}/assignments/${aID}`,
+              {
+                headers: { Authorization: `Bearer ${token}` },
+              }
+            );
+            if (singleA.ok) {
+              assignmentObjects.push(await singleA.json());
+            }
+          }
+        }
       }
 
-      // 4️⃣ Push the combined object into “results”
+      // Turn assignmentObjects into a lookup by assignment_id → { name, points_possible, ... }
+      const assignLookup = {};
+      assignmentObjects.forEach((a) => {
+        assignLookup[a.id] = {
+          name: a.name,
+          possible: a.points_possible,
+        };
+      });
+
+      // 4) Now combine submissions + assignment info into a compact array
+      const assignmentsList = submissions.map((s) => {
+        const info = assignLookup[s.assignment_id] || {
+          name: 'Unknown Assignment',
+          possible: null,
+        };
+        return {
+          name: info.name,
+          score: s.score, // numeric points earned (or null if not graded)
+          possible: info.possible,
+          status: s.workflow_state, // e.g. "graded", "missing", "late", etc.
+        };
+      });
+
+      // 5) Push the result for this course
       results.push({
         course: course.name,
         current_grade: currentGrade,
@@ -97,7 +155,7 @@ app.post('/api/grades', async (req, res) => {
       });
     }
 
-    // 5️⃣ Return that combined array
+    // 6) Return the combined array
     return res.json(results);
   } catch (err) {
     console.error('Proxy Error:', err);
